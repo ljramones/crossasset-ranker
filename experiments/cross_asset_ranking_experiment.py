@@ -47,6 +47,7 @@ from evaluation.cross_asset_ranking import (
 
 
 FEATURE_NORMALIZATION_CHOICES: tuple[str, ...] = ("none", "per_asset_train_zscore")
+REGIME_ARCHITECTURE_CHOICES: tuple[str, ...] = ("none", "vix_tercile")
 KNOWN_MODELS: tuple[str, ...] = (
     "momentum_baseline",
     "linear_regression",
@@ -101,6 +102,8 @@ class CrossAssetRankingConfig:
     feature_normalization: str = "none"
     include_cross_sectional_features: bool = False
     include_regime_interactions: bool = False
+    regime_architecture: str = "none"  # "none" | "vix_tercile"
+    regime_min_train_days: int = 120
 
 
 def load_prepared_asset_frames(
@@ -197,13 +200,21 @@ def _build_panel(
             asset_col=DEFAULT_ASSET_COLUMN,
             return_col=DEFAULT_RETURN_COLUMN,
         )
-    if config.include_regime_interactions:
-        if not config.include_cross_sectional_features:
-            raise ValueError(
-                "include_regime_interactions requires include_cross_sectional_features=True "
-                "(interactions are products of the cross-sectional rank features)."
-            )
+    regime_arch = (config.regime_architecture or "none").lower()
+    needs_vix_z = bool(config.include_regime_interactions) or (regime_arch == "vix_tercile")
+    if config.include_regime_interactions and not config.include_cross_sectional_features:
+        raise ValueError(
+            "include_regime_interactions requires include_cross_sectional_features=True "
+            "(interactions are products of the cross-sectional rank features)."
+        )
+    if regime_arch == "vix_tercile" and not config.include_cross_sectional_features:
+        raise ValueError(
+            "regime_architecture='vix_tercile' requires include_cross_sectional_features=True "
+            "(v1 cross-sectional rank features are the per-regime inputs)."
+        )
+    if needs_vix_z:
         panel = add_vix_zscore_to_panel(panel, date_col=DEFAULT_DATE_COLUMN, window=252)
+    if config.include_regime_interactions:
         panel = add_regime_interaction_features(
             panel,
             base_features=_CROSS_SECTIONAL_FEATURE_COLUMNS,
@@ -275,29 +286,43 @@ def _score_test_panel(
     test_panel: pd.DataFrame,
     feature_columns: list[str],
     target_column: str,
-) -> tuple[pd.Series, list[dict]]:
-    """Return (scores, feature_importance_rows) aligned to ``test_panel`` rows.
+    regime_architecture: str = "none",
+    regime_min_train_days: int = 120,
+    split_id: int = 0,
+) -> tuple[pd.Series, list[dict], dict | None]:
+    """Return (scores, feature_importance_rows, regime_diagnostics).
 
-    For model families that expose per-feature importance (currently just
-    ``lambdarank``), the second element is a list of one dict per feature with
-    keys ``feature``, ``gain``, ``split_count``. For other models the list is
-    empty — the caller can still concatenate it harmlessly.
+    ``regime_diagnostics`` is ``None`` for non-regime runs and a dict carrying
+    per-fold tercile cutoffs and per-regime sample counts when regime
+    architecture is active.
     """
 
     if model_name == "momentum_baseline":
         if "return_20d" in test_panel.columns:
-            return test_panel["return_20d"].astype(float), []
+            return test_panel["return_20d"].astype(float), [], None
         if "momentum_norm" in test_panel.columns:
-            return test_panel["momentum_norm"].astype(float), []
+            return test_panel["momentum_norm"].astype(float), [], None
         raise KeyError("momentum_baseline requires 'return_20d' or 'momentum_norm' in panel.")
 
     if model_name == "lambdarank":
-        return _score_with_lambdarank(
+        if regime_architecture == "vix_tercile":
+            scores, importance, diag = _score_with_regime_lambdarank(
+                train_panel=train_panel,
+                test_panel=test_panel,
+                feature_columns=feature_columns,
+                target_column=target_column,
+                regime_col="vix_zscore_252d",
+                min_train_days=int(regime_min_train_days),
+                split_id=int(split_id),
+            )
+            return scores, importance, diag
+        scores, importance = _score_with_lambdarank(
             train_panel=train_panel,
             test_panel=test_panel,
             feature_columns=feature_columns,
             target_column=target_column,
         )
+        return scores, importance, None
 
     pipeline = _build_model(model_name)
     if pipeline is None:
@@ -305,46 +330,37 @@ def _score_test_panel(
 
     train = train_panel.dropna(subset=[target_column]).copy()
     if train.empty:
-        return pd.Series(np.nan, index=test_panel.index, name="score"), []
+        return pd.Series(np.nan, index=test_panel.index, name="score"), [], None
     pipeline.fit(train[feature_columns], train[target_column])
     scores = pd.Series(pipeline.predict(test_panel[feature_columns]), index=test_panel.index, name="score")
-    return scores, []
+    return scores, [], None
 
 
-def _score_with_lambdarank(
-    *,
+def _fit_lambdarank_on_panel(
     train_panel: pd.DataFrame,
-    test_panel: pd.DataFrame,
+    *,
     feature_columns: list[str],
     target_column: str,
     date_col: str = DEFAULT_DATE_COLUMN,
     asset_col: str = DEFAULT_ASSET_COLUMN,
-) -> pd.Series:
-    """Fit LightGBM LambdaRank with per-date groups and score the test panel.
+):
+    """Fit a LightGBM LambdaRank model on a panel and return (model, n_train_dates).
 
-    Training rows: only those with a non-NaN ``target_column``. Dates with
-    fewer than 2 valid rows are dropped (no rankable pairs). Rows are sorted by
-    ``date`` then ``asset`` so each date's group is contiguous, then converted
-    into integer per-date relevance labels via
-    :func:`make_lambdarank_relevance_labels`.
-
-    At score time every row of ``test_panel`` is scored individually; LightGBM's
-    predict() does not require group information.
+    Returns (None, 0) when the panel has too few rankable rows. Caller is
+    responsible for handling that case (typically by falling back to a pooled
+    model or leaving scores NaN).
     """
-
     from lightgbm import LGBMRanker
 
     train = train_panel.dropna(subset=[target_column]).copy()
     if train.empty:
-        return pd.Series(np.nan, index=test_panel.index, name="score")
-
+        return None, 0
     train = train.sort_values([date_col, asset_col]).reset_index(drop=True)
     group_sizes = train.groupby(date_col, sort=False).size()
     keep_dates = group_sizes[group_sizes >= 2].index
     train = train[train[date_col].isin(keep_dates)].reset_index(drop=True)
     if train.empty:
-        return pd.Series(np.nan, index=test_panel.index, name="score")
-
+        return None, 0
     relevance = make_lambdarank_relevance_labels(
         train,
         date_col=date_col,
@@ -352,11 +368,9 @@ def _score_with_lambdarank(
     )
     train = train.assign(_relevance=relevance.astype("Int64"))
     train = train.dropna(subset=["_relevance"]).reset_index(drop=True)
-
     groups = build_lambdarank_groups(train, date_col=date_col)
     if not groups:
-        return pd.Series(np.nan, index=test_panel.index, name="score")
-
+        return None, 0
     model = LGBMRanker(
         objective="lambdarank",
         metric="ndcg",
@@ -367,24 +381,177 @@ def _score_with_lambdarank(
         random_state=42,
         verbose=-1,
     )
-    X_train = train[feature_columns].astype(float)
-    y_train = train["_relevance"].astype(int).to_numpy()
-    model.fit(X_train, y_train, group=groups)
+    model.fit(train[feature_columns].astype(float), train["_relevance"].astype(int).to_numpy(), group=groups)
+    return model, int(train[date_col].nunique())
 
-    X_test = test_panel[feature_columns].astype(float)
-    scores = pd.Series(model.predict(X_test), index=test_panel.index, name="score")
 
+def _extract_feature_importance_rows(
+    model,
+    feature_columns: list[str],
+    *,
+    extra_tags: dict | None = None,
+) -> list[dict]:
     gain = np.asarray(model.booster_.feature_importance(importance_type="gain"), dtype=float)
     split_count = np.asarray(model.booster_.feature_importance(importance_type="split"), dtype=int)
-    importance_rows: list[dict] = [
-        {
-            "feature": str(feature),
-            "gain": float(gain[i]),
-            "split_count": int(split_count[i]),
-        }
+    base = dict(extra_tags or {})
+    return [
+        {**base, "feature": str(feature), "gain": float(gain[i]), "split_count": int(split_count[i])}
         for i, feature in enumerate(feature_columns)
     ]
+
+
+def _score_with_lambdarank(
+    *,
+    train_panel: pd.DataFrame,
+    test_panel: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    date_col: str = DEFAULT_DATE_COLUMN,
+    asset_col: str = DEFAULT_ASSET_COLUMN,
+) -> tuple[pd.Series, list[dict]]:
+    """Pooled LambdaRank baseline — single model on full train panel."""
+
+    model, _ = _fit_lambdarank_on_panel(
+        train_panel,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        date_col=date_col,
+        asset_col=asset_col,
+    )
+    if model is None:
+        return pd.Series(np.nan, index=test_panel.index, name="score"), []
+    X_test = test_panel[feature_columns].astype(float)
+    scores = pd.Series(model.predict(X_test), index=test_panel.index, name="score")
+    importance_rows = _extract_feature_importance_rows(model, feature_columns)
     return scores, importance_rows
+
+
+def _score_with_regime_lambdarank(
+    *,
+    train_panel: pd.DataFrame,
+    test_panel: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    regime_col: str,
+    min_train_days: int,
+    split_id: int,
+    date_col: str = DEFAULT_DATE_COLUMN,
+    asset_col: str = DEFAULT_ASSET_COLUMN,
+) -> tuple[pd.Series, list[dict], dict]:
+    """Per-regime LambdaRank: VIX-z tercile cutoffs on train, regime-specific fits.
+
+    Returns ``(scores, importance_rows, diagnostics)`` where ``diagnostics`` carries
+    the per-fold tercile cutoffs, per-regime train-day counts, and a fallback log
+    listing any regime that defaulted to the pooled model.
+    """
+
+    diagnostics: dict = {
+        "split_id": int(split_id),
+        "regime_col": regime_col,
+        "cutoffs": {},
+        "train_days_per_regime": {},
+        "test_days_per_regime": {},
+        "fallback_used_for_regime": [],
+        "min_train_days_required": int(min_train_days),
+    }
+
+    if regime_col not in train_panel.columns or regime_col not in test_panel.columns:
+        raise KeyError(f"_score_with_regime_lambdarank: missing regime column {regime_col!r} in panels.")
+
+    train_zs = (
+        train_panel[[date_col, regime_col]]
+        .dropna(subset=[regime_col])
+        .drop_duplicates(date_col)[regime_col]
+    )
+    if len(train_zs) < 3:
+        # Pathological: not enough train dates to define terciles. Fall back fully.
+        scores, importance_rows = _score_with_lambdarank(
+            train_panel=train_panel,
+            test_panel=test_panel,
+            feature_columns=feature_columns,
+            target_column=target_column,
+            date_col=date_col,
+            asset_col=asset_col,
+        )
+        diagnostics["fallback_used_for_regime"] = ["low_vix", "mid_vix", "high_vix"]
+        diagnostics["pooled_fallback_full_split"] = True
+        return scores, [{**r, "regime": "pooled_fallback_full_split"} for r in importance_rows], diagnostics
+
+    low_cut = float(train_zs.quantile(1.0 / 3.0))
+    high_cut = float(train_zs.quantile(2.0 / 3.0))
+    diagnostics["cutoffs"] = {"low": low_cut, "high": high_cut}
+
+    def _label(z: float) -> str | None:
+        if pd.isna(z):
+            return None
+        if z <= low_cut:
+            return "low_vix"
+        if z >= high_cut:
+            return "high_vix"
+        return "mid_vix"
+
+    train_panel = train_panel.copy()
+    test_panel = test_panel.copy()
+    train_panel["_regime"] = train_panel[regime_col].map(_label)
+    test_panel["_regime"] = test_panel[regime_col].map(_label)
+
+    regime_models: dict[str, object] = {}
+    importance_rows: list[dict] = []
+    pooled_model = None
+
+    for regime in ("low_vix", "mid_vix", "high_vix"):
+        sub = train_panel[train_panel["_regime"] == regime]
+        n_dates = int(sub[date_col].nunique())
+        diagnostics["train_days_per_regime"][regime] = n_dates
+        if n_dates < min_train_days:
+            diagnostics["fallback_used_for_regime"].append(regime)
+            regime_models[regime] = None
+            continue
+        model, _ = _fit_lambdarank_on_panel(
+            sub,
+            feature_columns=feature_columns,
+            target_column=target_column,
+            date_col=date_col,
+            asset_col=asset_col,
+        )
+        regime_models[regime] = model
+        if model is not None:
+            importance_rows.extend(
+                _extract_feature_importance_rows(model, feature_columns, extra_tags={"regime": regime})
+            )
+
+    if any(m is None for m in regime_models.values()):
+        pooled_model, _ = _fit_lambdarank_on_panel(
+            train_panel,
+            feature_columns=feature_columns,
+            target_column=target_column,
+            date_col=date_col,
+            asset_col=asset_col,
+        )
+        if pooled_model is not None:
+            importance_rows.extend(
+                _extract_feature_importance_rows(
+                    pooled_model, feature_columns, extra_tags={"regime": "pooled_fallback"}
+                )
+            )
+
+    # Score: route each test row through the model for its date's regime.
+    scores = pd.Series(np.nan, index=test_panel.index, name="score")
+    for regime, sub_test in test_panel.groupby("_regime", dropna=False):
+        if sub_test.empty:
+            continue
+        diagnostics["test_days_per_regime"][str(regime) if regime is not None else "unlabeled"] = int(
+            sub_test[date_col].nunique()
+        )
+        model = regime_models.get(regime) if regime is not None else None
+        if model is None:
+            model = pooled_model
+        if model is None:
+            continue
+        X = sub_test[feature_columns].astype(float)
+        scores.loc[sub_test.index] = model.predict(X)
+
+    return scores, importance_rows, diagnostics
 
 
 def _build_metrics_row(
@@ -544,6 +711,7 @@ def run_cross_asset_ranking_experiment(
     scored_rows: list[pd.DataFrame] = []
     allocation_rows: list[pd.DataFrame] = []
     feature_importance_rows: list[dict] = []
+    regime_diagnostics_rows: list[dict] = []
     portfolio_rows: list[pd.DataFrame] = []
     null_rows: list[dict] = []
     null_pvalue_rows: list[dict] = []
@@ -608,12 +776,15 @@ def run_cross_asset_ranking_experiment(
         fold_rows.append(equal_metrics)
 
         for model_name in config.model_names:
-            scores, importance_for_split = _score_test_panel(
+            scores, importance_for_split, regime_diag = _score_test_panel(
                 model_name=model_name,
                 train_panel=train_features,
                 test_panel=test_features,
                 feature_columns=feature_columns,
                 target_column=target_column,
+                regime_architecture=config.regime_architecture,
+                regime_min_train_days=config.regime_min_train_days,
+                split_id=split_id,
             )
             for row in importance_for_split:
                 feature_importance_rows.append({
@@ -621,6 +792,8 @@ def run_cross_asset_ranking_experiment(
                     "model": model_name,
                     **row,
                 })
+            if regime_diag is not None:
+                regime_diagnostics_rows.append({**regime_diag, "model": model_name})
             scored = test_features[[DEFAULT_DATE_COLUMN, DEFAULT_ASSET_COLUMN]].copy()
             scored["score"] = scores.values
             scored["model"] = model_name
@@ -771,6 +944,8 @@ def run_cross_asset_ranking_experiment(
         "feature_normalization": str(config.feature_normalization),
         "include_cross_sectional_features": bool(config.include_cross_sectional_features),
         "include_regime_interactions": bool(config.include_regime_interactions),
+        "regime_architecture": str(config.regime_architecture),
+        "regime_min_train_days": int(config.regime_min_train_days),
     }
 
     feature_importance_frame = (
@@ -778,6 +953,8 @@ def run_cross_asset_ranking_experiment(
         if feature_importance_rows
         else pd.DataFrame(columns=["split_id", "model", "feature", "gain", "split_count"])
     )
+
+    regime_diagnostics_frame = _summarize_regime_diagnostics(regime_diagnostics_rows)
 
     # ICIR + per-fold Spearman. Computed once per (model, split) using realized
     # target values from the panel and the model's predicted scores from the
@@ -811,8 +988,46 @@ def run_cross_asset_ranking_experiment(
         "null_pvalues": null_pvalues,
         "feature_importance": feature_importance_frame,
         "ranking_diagnostics": icir_records,
+        "regime_diagnostics": regime_diagnostics_frame,
         "metadata": metadata,
     }
+
+
+def _summarize_regime_diagnostics(rows: list[dict]) -> pd.DataFrame:
+    """Flatten per-(split, model) regime diagnostics into a long-format CSV.
+
+    One row per (split_id, model, regime) with cutoffs, train/test day counts,
+    and a fallback flag.
+    """
+    out: list[dict] = []
+    for r in rows:
+        split_id = r.get("split_id")
+        model = r.get("model")
+        cutoffs = r.get("cutoffs", {}) or {}
+        train_days = r.get("train_days_per_regime", {}) or {}
+        test_days = r.get("test_days_per_regime", {}) or {}
+        fallbacks = set(r.get("fallback_used_for_regime", []) or [])
+        for regime in ("low_vix", "mid_vix", "high_vix"):
+            out.append(
+                {
+                    "split_id": int(split_id) if split_id is not None else None,
+                    "model": model,
+                    "regime": regime,
+                    "tercile_low_cutoff": cutoffs.get("low"),
+                    "tercile_high_cutoff": cutoffs.get("high"),
+                    "train_days_in_regime": int(train_days.get(regime, 0)),
+                    "test_days_in_regime": int(test_days.get(regime, 0)),
+                    "used_pooled_fallback": regime in fallbacks,
+                }
+            )
+    return pd.DataFrame(out) if out else pd.DataFrame(
+        columns=[
+            "split_id", "model", "regime",
+            "tercile_low_cutoff", "tercile_high_cutoff",
+            "train_days_in_regime", "test_days_in_regime",
+            "used_pooled_fallback",
+        ]
+    )
 
 
 def _compute_spearman_and_icir(

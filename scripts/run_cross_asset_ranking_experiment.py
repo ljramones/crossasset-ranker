@@ -19,6 +19,7 @@ from experiments.cross_asset_ranking_experiment import (
     CrossAssetRankingConfig,
     FEATURE_NORMALIZATION_CHOICES,
     KNOWN_MODELS,
+    REGIME_ARCHITECTURE_CHOICES,
     load_prepared_asset_frames,
     run_cross_asset_ranking_experiment,
 )
@@ -93,6 +94,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--regime-architecture",
+        choices=list(REGIME_ARCHITECTURE_CHOICES),
+        default="none",
+        help=(
+            "Per-regime LambdaRank architecture. 'vix_tercile' splits each fold's "
+            "training data into low/mid/high VIX z-score terciles (cutoffs fit on "
+            "train only) and trains a separate LambdaRank per regime. Test rows are "
+            "scored by the model for their date's regime. Falls back to a pooled "
+            "model for any regime with fewer than --regime-min-train-days days in "
+            "the fold. Default 'none' preserves the v1 pooled-model behavior."
+        ),
+    )
+    parser.add_argument(
+        "--regime-min-train-days",
+        type=int,
+        default=120,
+        help="Minimum train-day count per regime before fallback to pooled model.",
+    )
+    parser.add_argument(
         "--prepare-missing",
         action="store_true",
         help="Allow prepare_single_asset_feature_frame to fetch missing raw caches via yfinance.",
@@ -133,6 +153,8 @@ def _config_from_args(args: argparse.Namespace) -> CrossAssetRankingConfig:
         feature_normalization=str(args.feature_normalization),
         include_cross_sectional_features=bool(args.include_cross_sectional_features),
         include_regime_interactions=bool(args.include_regime_interactions),
+        regime_architecture=str(args.regime_architecture),
+        regime_min_train_days=int(args.regime_min_train_days),
     )
 
 
@@ -159,6 +181,8 @@ def _print_dry_run(args: argparse.Namespace, timestamp: str) -> None:
     print(f"  feature_normalization:{args.feature_normalization}")
     print(f"  include_xs_features:  {args.include_cross_sectional_features}")
     print(f"  include_regime_interactions: {args.include_regime_interactions}")
+    print(f"  regime_architecture:  {args.regime_architecture}")
+    print(f"  regime_min_train_days:{args.regime_min_train_days}")
 
 
 def _markdown_table(frame: pd.DataFrame, *, max_rows: int = 50) -> str:
@@ -204,10 +228,11 @@ def write_output_bundle(
         "null_pvalues": output_dir / f"cross_asset_ranking_null_pvalues_{timestamp}.csv",
         "feature_importance": output_dir / f"cross_asset_ranking_feature_importance_{timestamp}.csv",
         "ranking_diagnostics": output_dir / f"cross_asset_ranking_ranking_diagnostics_{timestamp}.csv",
+        "regime_diagnostics": output_dir / f"cross_asset_ranking_regime_diagnostics_{timestamp}.csv",
         "report": output_dir / f"cross_asset_ranking_report_{timestamp}.md",
         "metadata": output_dir / f"cross_asset_ranking_metadata_{timestamp}.json",
     }
-    for key in ("summary", "fold_details", "scored_panel", "allocations", "portfolio_returns", "random_nulls", "null_pvalues", "feature_importance", "ranking_diagnostics"):
+    for key in ("summary", "fold_details", "scored_panel", "allocations", "portfolio_returns", "random_nulls", "null_pvalues", "feature_importance", "ranking_diagnostics", "regime_diagnostics"):
         frame = result.get(key)
         if frame is not None and not frame.empty:
             frame.to_csv(paths[key], index=False)

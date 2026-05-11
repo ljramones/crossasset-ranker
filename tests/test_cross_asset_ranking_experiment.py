@@ -131,6 +131,9 @@ def test_output_bundle_writer_creates_all_files(tmp_path: Path) -> None:
         "ranking_diagnostics": pd.DataFrame(
             {"model": ["lambdarank"], "overall_mean_spearman": [0.03], "spearman_std_across_folds": [0.02], "icir": [1.5], "n_folds": [5]}
         ),
+        "regime_diagnostics": pd.DataFrame(
+            {"split_id": [0], "model": ["lambdarank"], "regime": ["low_vix"], "train_days_in_regime": [200], "test_days_in_regime": [85], "used_pooled_fallback": [False], "tercile_low_cutoff": [-0.5], "tercile_high_cutoff": [0.5]}
+        ),
         "metadata": {
             "main_py_used": False,
             "prepare_experiment_used": False,
@@ -160,6 +163,7 @@ def test_output_bundle_writer_creates_all_files(tmp_path: Path) -> None:
         "null_pvalues",
         "feature_importance",
         "ranking_diagnostics",
+        "regime_diagnostics",
         "report",
         "metadata",
     }
@@ -265,6 +269,84 @@ def test_cli_dry_run_accepts_lambdarank_with_normalization(
     out = capsys.readouterr().out
     assert "lambdarank" in out
     assert "per_asset_train_zscore" in out
+
+
+def test_regime_architecture_produces_scores_and_diagnostics() -> None:
+    """A synthetic panel with VIX z-scores covering both tails should exercise all three regimes."""
+
+    rng = np.random.default_rng(31)
+    dates = pd.date_range("2018-01-02", periods=400, freq="B")
+    rows = []
+    # Inject a VIXClose series with enough variability for terciles to be non-degenerate.
+    vix_close = 18.0 + 6.0 * np.sin(np.linspace(0, 12 * np.pi, len(dates))) + rng.normal(0, 0.7, size=len(dates))
+    for asset, seed in zip(("AAA", "BBB", "CCC"), (1, 2, 3)):
+        rng_a = np.random.default_rng(seed)
+        rets = rng_a.normal(0.0005, 0.012, size=len(dates))
+        prices = 100.0 * np.exp(np.cumsum(rets))
+        rows.append(
+            pd.DataFrame(
+                {
+                    "date": dates,
+                    "Open": prices * 0.999,
+                    "High": prices * 1.005,
+                    "Low": prices * 0.995,
+                    "Close": prices,
+                    "Adj Close": prices,
+                    "Volume": rng_a.integers(1_000_000, 2_000_000, size=len(dates)),
+                    "BenchmarkClose": prices * 0.98,
+                    "VIXClose": vix_close,
+                    "return_1d": rets,
+                    "return_5d": pd.Series(rets).rolling(5).sum().fillna(0).to_numpy(),
+                    "return_20d": pd.Series(rets).rolling(20).sum().fillna(0).to_numpy(),
+                    "vol_ratio": rng_a.normal(1.0, 0.05, size=len(dates)),
+                    "momentum_norm": rng_a.normal(0.0, 0.5, size=len(dates)),
+                    "volume_zscore": rng_a.normal(0.0, 1.0, size=len(dates)),
+                    "benchmark_return_1d": rng_a.normal(0.0003, 0.01, size=len(dates)),
+                    "forward_simple_return_1d": np.roll(rets, -1),
+                    "asset_signal": rets + rng_a.normal(0, 0.001, size=len(dates)),
+                }
+            )
+        )
+    frames = {asset: frame.assign(asset=asset).reset_index(drop=True) for asset, frame in zip(("AAA", "BBB", "CCC"), rows)}
+
+    config = CrossAssetRankingConfig(
+        assets=("AAA", "BBB", "CCC"),
+        forward_horizon=5,
+        vol_window=5,
+        train_size=120,
+        val_size=40,
+        test_size=60,
+        step_size=60,
+        transaction_cost_bps=2.0,
+        top_k_values=(1, 2),
+        model_names=("lambdarank",),
+        random_null_runs=5,
+        random_state=42,
+        feature_normalization="per_asset_train_zscore",
+        include_cross_sectional_features=True,
+        regime_architecture="vix_tercile",
+        regime_min_train_days=20,
+    )
+
+    result = run_cross_asset_ranking_experiment(asset_frames=frames, config=config)
+
+    # Scored panel for lambdarank must contain non-null scores
+    scored = result["scored_panel"]
+    assert (scored["model"] == "lambdarank").any()
+    assert scored.loc[scored["model"] == "lambdarank", "score"].notna().any()
+
+    # Regime diagnostics frame must list all three regimes across splits
+    regime = result["regime_diagnostics"]
+    assert not regime.empty
+    assert set(regime["regime"].unique()) == {"low_vix", "mid_vix", "high_vix"}
+    assert (regime["tercile_low_cutoff"].notna()).any()
+
+    # Metadata safety flags
+    metadata = result["metadata"]
+    assert metadata["regime_architecture"] == "vix_tercile"
+    assert metadata["optuna_used"] is False
+    assert metadata["deep_models_used"] is False
+    assert metadata["stacking_used"] is False
 
 
 def test_metadata_safety_flags_are_present() -> None:
