@@ -1,0 +1,29 @@
+[project]
+name = "ml-trading-signal-exploration"
+version = "0.1.0"
+description = "Framework for walk-forward comparison of ML trading signal models on stationary features."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "hmmlearn>=0.3.3",
+    "lightgbm>=4.6.0",
+    "ipykernel>=7.2.0",
+    "jupyterlab>=4.5.7",
+    "lightning>=2.6.1",
+    "matplotlib>=3.10.9",
+    "neuralforecast>=3.0.2",
+    "numpy>=2.4.4",
+    "optuna>=4.5.0",
+    "pandas>=3.0.2",
+    "pytest>=8.4.2",
+    "pyyaml>=6.0.3",
+    "pytorch-forecasting>=1.5.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "statsmodels>=0.14.5",
+    "torch>=2.11.0",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.26.0",
+    "xgboost>=3.1.0",
+    "yfinance>=0.2.66",
+]

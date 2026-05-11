@@ -1,0 +1,114 @@
+# -------- Python --------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+.installed.cfg
+.eggs/
+
+# -------- Virtual environments --------
+.venv/
+venv/
+env/
+ENV/
+
+# -------- Test / lint caches --------
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# -------- Notebooks --------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# -------- IDE / editor --------
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# -------- OS --------
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# -------- Local secrets / env --------
+.env
+.env.*
+!.env.example
+*.pem
+
+# -------- Data caches (regenerable from yfinance) --------
+# Keep data/__init__.py and data/market_cache.py; ignore the cached OHLCV under
+# data/multi_asset_cache/ and any other CSV/parquet/meta sidecars in data/.
+data/multi_asset_cache/
+data/**/*.csv
+data/**/*.parquet
+data/**/*.feather
+data/**/*.h5
+data/**/*.hdf5
+data/**/*.meta.json
+
+# -------- Generated experiment outputs --------
+results/
+runs/
+lightning_logs/
+mlruns/
+wandb/
+tensorboard/
+logs/
+*.log
+
+# -------- Model artifacts --------
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.joblib
+*.onnx
+*.h5
+*.safetensors
+
+# -------- Hyperparameter / optimization stores --------
+optuna_studies/
+*.db
+*.sqlite
+*.sqlite3
+
+# -------- Plots / binary images --------
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.svg
+
+# -------- Misc generated --------
+*.bak
+*.tmp
+*.temp
+.Python

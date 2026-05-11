@@ -1,0 +1,261 @@
+champion:
+  version: "v1.0"
+  status: "frozen"
+  frozen_on: "2026-05-08"
+  name: "regime_stacking_ensemble_regime"
+  description: "Champion v1.0 Frozen. This manifest captures the exact SPY single-asset champion before any further feature or model upgrades."
+  observed_metrics:
+    source_file: "results/regime_stacking_comparison.csv"
+    comparison_mode: "regime_features"
+    net_sharpe: 1.4358450036855563
+    net_sortino: 1.9008105311402257
+    calmar: 2.619756571892874
+    trade_frequency: 0.9489087301587302
+    gross_total_return: 0.20431058633174606
+    net_total_return: 0.2017951169029075
+
+data:
+  source: "yfinance"
+  primary_ticker: "SPY"
+  benchmark_ticker: "SPY"
+  vix_ticker: "^VIX"
+  configured_start_date: "2010-01-01"
+  observed_cache_file: "data/multi_asset_cache/spy_daily.csv"
+  observed_cache_span:
+    first_row: "2010-01-04"
+    last_non_empty_row: "2026-05-06"
+  benchmark_joining:
+    benchmark_close_column: "BenchmarkClose"
+    benchmark_return_column: "benchmark_return_1d"
+    vix_close_column: "VIXClose"
+    missing_vix_handling: "forward_fill"
+
+feature_set:
+  enabled_families:
+    - "base stationary features"
+    - "advanced features"
+    - "VIX features"
+    - "regime features"
+    - "cross-asset relative features"
+  base_features:
+    - "return_1d"
+    - "return_5d"
+    - "return_20d"
+    - "vol_ratio"
+    - "momentum_norm"
+    - "volume_zscore"
+    - "range_norm"
+    - "sma_ratio"
+    - "realized_vol_20"
+    - "close_to_open_gap"
+    - "price_acceleration"
+    - "downside_vol_ratio"
+  advanced_features:
+    - "rsi_zscore"
+    - "macd_histogram_zscore"
+    - "bollinger_band_width_zscore"
+    - "relative_strength_vs_benchmark"
+    - "overnight_gap_zscore"
+    - "volume_trend_strength"
+    - "autocorrelation_zscore"
+    - "volatility_regime"
+    - "price_acceleration_2nd"
+    - "asset_return_vs_spy"
+    - "relative_vol_ratio"
+    - "vix_relative"
+  vix_features:
+    - "vix_zscore"
+    - "implied_vs_realized_vol"
+    - "vix_momentum_5d"
+    - "vix_extreme"
+    - "vix_vol_interaction"
+    - "vix_return_1d"
+    - "vix_return_5d"
+  regime_features:
+    - "regime_id"
+    - "regime_prob_0"
+    - "regime_prob_1"
+    - "regime_prob_2"
+    - "momentum_x_regime_bull"
+    - "momentum_x_regime_high_vol"
+    - "vol_ratio_x_regime_high_vol"
+  leakage_controls:
+    target_horizon_days: 1
+    rolling_windows:
+      short: 5
+      medium: 20
+      long_rule: "max(60, medium_window * 3)"
+    stationarity_check: "ADF at significance 0.05"
+    dropna: true
+    raw_prices_excluded_from_feature_matrix: true
+
+regime_layer:
+  enabled: true
+  detector_backend_preference: "Hidden Markov Model via hmmlearn"
+  fallback_backend: "GaussianMixture"
+  n_regimes: 3
+  canonical_mapping:
+    0: "bull"
+    1: "bear"
+    2: "high_volatility"
+  inference_columns:
+    - "return_5d"
+    - "return_20d"
+    - "momentum_norm"
+    - "vol_ratio"
+    - "realized_vol_20"
+    - "downside_vol_ratio"
+    - "vix_zscore"
+    - "implied_vs_realized_vol"
+    - "vix_momentum_5d"
+  trade_filter:
+    enabled: false
+    filter_mode: "aggressive"
+    min_regime_prob: 0.70
+    auto_detect_best_regime: true
+
+walk_forward_pipeline:
+  train_size: 756
+  validation_size: 252
+  test_size: 252
+  step_size: 252
+  min_history: 756
+  evaluation_discipline:
+    - "walk-forward windows strictly time ordered"
+    - "each model fit on train, tuned against validation, evaluated on test only"
+    - "deep models store history_frame=train+validation only for causal rolling inference"
+    - "ensemble meta-learners train on true prior out-of-fold base predictions only"
+  scaling:
+    lstm: "StandardScaler fit on train_frame[feature_columns] only"
+    itransformer: "StandardScaler fit on train_frame[feature_columns] only"
+    patchtst: "StandardScaler fit on train_frame[feature_columns] only"
+    temporal_fusion_transformer: "StandardScaler fit on train_frame[feature_columns] only"
+    regime_detector: "StandardScaler fit on training inference features only"
+
+champion_model:
+  family: "regime-aware logistic stacking ensemble"
+  default_when_regime_enabled: true
+  ensemble_label: "regime_stacking_ensemble"
+  meta_learner: "LogisticRegression(max_iter=1000)"
+  include_interactions: false
+  signal_threshold: 0.5
+  base_models:
+    - name: "lstm"
+      tuning_status: "tuned"
+      params:
+        input_size: 20
+        hidden_size: 32
+        num_layers: 2
+        dropout: 0.13892822529494187
+        learning_rate: 0.000920393899213809
+        weight_decay: 1.3404071077633212e-05
+        max_epochs: 6
+    - name: "itransformer"
+      tuning_status: "tuned"
+      params:
+        input_size: 40
+        hidden_size: 64
+        n_heads: 4
+        feedforward_size: 192
+        encoder_layers: 1
+        dropout: 0.23734019050415717
+        learning_rate: 0.0002575315480739743
+        weight_decay: 2.6239760136968426e-05
+        max_epochs: 9
+    - name: "patchtst"
+      tuning_status: "tuned"
+      params:
+        input_size: 30
+        patch_len: 5
+        stride: 5
+        hidden_size: 64
+        feedforward_size: 128
+        encoder_layers: 3
+        n_heads: 4
+        dropout: 0.1602818437447004
+        learning_rate: 0.0004686302791169591
+        weight_decay: 5.7753597887925164e-05
+        max_epochs: 6
+    - name: "temporal_fusion_transformer"
+      tuning_status: "default_config"
+      params:
+        max_encoder_length: 30
+        max_prediction_length: 1
+        hidden_size: 16
+        attention_head_size: 2
+        hidden_continuous_size: 8
+        lstm_layers: 1
+        dropout: 0.1
+        learning_rate: 0.001
+        batch_size: 64
+        max_epochs: 3
+        gradient_clip_val: 0.1
+        early_stopping_patience: 2
+        reduce_on_plateau_patience: 2
+        limit_train_batches: 1.0
+        num_workers: 0
+  meta_features:
+    - "probability__lstm"
+    - "probability__itransformer"
+    - "probability__patchtst"
+    - "probability__temporal_fusion_transformer"
+    - "regime_prob_0"
+    - "regime_prob_1"
+    - "regime_prob_2"
+
+optuna_search_space:
+  objective: "maximize net_sharpe"
+  tuning_models:
+    - "lstm"
+    - "itransformer"
+    - "patchtst"
+  current_default_trials: 15
+  lstm:
+    input_size: [20, 30, 40]
+    hidden_size: [32, 64, 96]
+    num_layers: [1, 2, 3]
+    dropout: "uniform(0.05, 0.30)"
+    learning_rate: "loguniform(1e-4, 5e-3)"
+    weight_decay: "loguniform(1e-5, 1e-3)"
+    max_epochs: [6, 16]
+  itransformer:
+    input_size: [20, 30, 40]
+    hidden_size: [32, 64, 96]
+    n_heads_rule: "hidden_size // 16"
+    feedforward_size: [64, 128, 192]
+    encoder_layers: [1, 2, 3]
+    dropout: "uniform(0.05, 0.30)"
+    learning_rate: "loguniform(1e-4, 5e-3)"
+    weight_decay: "loguniform(1e-5, 1e-3)"
+    max_epochs: [6, 12]
+  patchtst:
+    input_size: [20, 30, 40]
+    patch_len: [5, 10, 15]
+    stride: [5, 10]
+    hidden_size: [32, 64, 96]
+    feedforward_size: [64, 128, 192]
+    encoder_layers: [1, 2, 3]
+    n_heads: [2, 4, 8]
+    dropout: "uniform(0.05, 0.30)"
+    learning_rate: "loguniform(1e-4, 5e-3)"
+    weight_decay: "loguniform(1e-5, 1e-3)"
+    max_epochs: [6, 12]
+
+reproducibility:
+  global_seed: 42
+  numpy_seed: 42
+  python_random_seed: 42
+  torch_seed: 42
+  hmm_random_state: 42
+  gmm_random_state: 42
+  tft_trainer_deterministic: true
+
+cost_model:
+  transaction_cost_bps: 2.0
+  description: "Costs applied on position flips using the executed position stream."
+  execution_rule: "signal shifted by one bar before applying returns"
+  turnover_definition: "abs(diff(executed_position)) with entry cost charged on initial position"
+
+versioning_note:
+  current_freeze_label: "Champion v1.0 Frozen"
+  next_change_label: "v1.1+"
