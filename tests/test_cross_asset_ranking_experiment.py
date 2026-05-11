@@ -125,6 +125,12 @@ def test_output_bundle_writer_creates_all_files(tmp_path: Path) -> None:
         "portfolio_returns": pd.DataFrame({"date": [pd.Timestamp("2020-01-01")], "net_return": [0.0]}),
         "random_nulls": pd.DataFrame({"split_id": [0], "top_k": [1], "null_run": ["run_0000"]}),
         "null_pvalues": pd.DataFrame({"split_id": [0], "top_k": [1], "model": ["x"], "pvalue_ir_ge_random_top_k": [0.5]}),
+        "feature_importance": pd.DataFrame(
+            {"split_id": [0], "model": ["lambdarank"], "feature": ["xs_rank_ret_20d"], "gain": [1.0], "split_count": [1]}
+        ),
+        "ranking_diagnostics": pd.DataFrame(
+            {"model": ["lambdarank"], "overall_mean_spearman": [0.03], "spearman_std_across_folds": [0.02], "icir": [1.5], "n_folds": [5]}
+        ),
         "metadata": {
             "main_py_used": False,
             "prepare_experiment_used": False,
@@ -152,6 +158,8 @@ def test_output_bundle_writer_creates_all_files(tmp_path: Path) -> None:
         "portfolio_returns",
         "random_nulls",
         "null_pvalues",
+        "feature_importance",
+        "ranking_diagnostics",
         "report",
         "metadata",
     }

@@ -24,7 +24,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from evaluation.cross_asset_ranking import (
+    _CROSS_SECTIONAL_FEATURE_COLUMNS,
+    _REGIME_INTERACTION_FEATURE_COLUMNS,
+    add_cross_sectional_features,
     add_cross_sectional_ranks,
+    add_regime_interaction_features,
+    add_vix_zscore_to_panel,
     apply_rebalance_schedule,
     asset_selection_counts,
     assets_selected_per_date,
@@ -58,6 +63,17 @@ DEFAULT_DATE_COLUMN = "date"
 DEFAULT_ASSET_COLUMN = "asset"
 
 
+def target_column_for_horizon(forward_horizon: int) -> str:
+    """Return the target column name for a given forward horizon.
+
+    Mirrors :func:`evaluation.cross_asset_ranking.build_cross_asset_panel`'s
+    column-naming convention so the experiment runner and the panel builder
+    stay in lockstep.
+    """
+
+    return f"forward_{int(forward_horizon)}d_risk_adjusted_return"
+
+
 @dataclass
 class CrossAssetRankingConfig:
     """Run configuration for the cross-asset ranking feasibility prototype."""
@@ -83,6 +99,8 @@ class CrossAssetRankingConfig:
     annualization_factor: int = 252
     rebalance_every: int = 1
     feature_normalization: str = "none"
+    include_cross_sectional_features: bool = False
+    include_regime_interactions: bool = False
 
 
 def load_prepared_asset_frames(
@@ -170,8 +188,27 @@ def _build_panel(
     panel = add_cross_sectional_ranks(
         panel,
         date_col=DEFAULT_DATE_COLUMN,
-        target_col=DEFAULT_TARGET_COLUMN,
+        target_col=target_column_for_horizon(config.forward_horizon),
     )
+    if config.include_cross_sectional_features:
+        panel = add_cross_sectional_features(
+            panel,
+            date_col=DEFAULT_DATE_COLUMN,
+            asset_col=DEFAULT_ASSET_COLUMN,
+            return_col=DEFAULT_RETURN_COLUMN,
+        )
+    if config.include_regime_interactions:
+        if not config.include_cross_sectional_features:
+            raise ValueError(
+                "include_regime_interactions requires include_cross_sectional_features=True "
+                "(interactions are products of the cross-sectional rank features)."
+            )
+        panel = add_vix_zscore_to_panel(panel, date_col=DEFAULT_DATE_COLUMN, window=252)
+        panel = add_regime_interaction_features(
+            panel,
+            base_features=_CROSS_SECTIONAL_FEATURE_COLUMNS,
+            regime_col="vix_zscore_252d",
+        )
     return panel
 
 
@@ -238,14 +275,20 @@ def _score_test_panel(
     test_panel: pd.DataFrame,
     feature_columns: list[str],
     target_column: str,
-) -> pd.Series:
-    """Return scores aligned to ``test_panel`` rows (NaN where unavailable)."""
+) -> tuple[pd.Series, list[dict]]:
+    """Return (scores, feature_importance_rows) aligned to ``test_panel`` rows.
+
+    For model families that expose per-feature importance (currently just
+    ``lambdarank``), the second element is a list of one dict per feature with
+    keys ``feature``, ``gain``, ``split_count``. For other models the list is
+    empty — the caller can still concatenate it harmlessly.
+    """
 
     if model_name == "momentum_baseline":
         if "return_20d" in test_panel.columns:
-            return test_panel["return_20d"].astype(float)
+            return test_panel["return_20d"].astype(float), []
         if "momentum_norm" in test_panel.columns:
-            return test_panel["momentum_norm"].astype(float)
+            return test_panel["momentum_norm"].astype(float), []
         raise KeyError("momentum_baseline requires 'return_20d' or 'momentum_norm' in panel.")
 
     if model_name == "lambdarank":
@@ -262,10 +305,10 @@ def _score_test_panel(
 
     train = train_panel.dropna(subset=[target_column]).copy()
     if train.empty:
-        return pd.Series(np.nan, index=test_panel.index, name="score")
+        return pd.Series(np.nan, index=test_panel.index, name="score"), []
     pipeline.fit(train[feature_columns], train[target_column])
     scores = pd.Series(pipeline.predict(test_panel[feature_columns]), index=test_panel.index, name="score")
-    return scores
+    return scores, []
 
 
 def _score_with_lambdarank(
@@ -330,7 +373,18 @@ def _score_with_lambdarank(
 
     X_test = test_panel[feature_columns].astype(float)
     scores = pd.Series(model.predict(X_test), index=test_panel.index, name="score")
-    return scores
+
+    gain = np.asarray(model.booster_.feature_importance(importance_type="gain"), dtype=float)
+    split_count = np.asarray(model.booster_.feature_importance(importance_type="split"), dtype=int)
+    importance_rows: list[dict] = [
+        {
+            "feature": str(feature),
+            "gain": float(gain[i]),
+            "split_count": int(split_count[i]),
+        }
+        for i, feature in enumerate(feature_columns)
+    ]
+    return scores, importance_rows
 
 
 def _build_metrics_row(
@@ -476,8 +530,9 @@ def run_cross_asset_ranking_experiment(
 ) -> dict[str, pd.DataFrame | dict]:
     """Run the prototype end-to-end on already-prepared per-asset frames."""
 
+    target_column = target_column_for_horizon(config.forward_horizon)
     panel = _build_panel(asset_frames, config=config)
-    feature_columns = select_cross_asset_feature_columns(panel, target_col=DEFAULT_TARGET_COLUMN)
+    feature_columns = select_cross_asset_feature_columns(panel, target_col=target_column)
     if not feature_columns:
         raise RuntimeError("No usable feature columns were selected from the panel.")
 
@@ -488,6 +543,7 @@ def run_cross_asset_ranking_experiment(
     fold_rows: list[dict] = []
     scored_rows: list[pd.DataFrame] = []
     allocation_rows: list[pd.DataFrame] = []
+    feature_importance_rows: list[dict] = []
     portfolio_rows: list[pd.DataFrame] = []
     null_rows: list[dict] = []
     null_pvalue_rows: list[dict] = []
@@ -552,13 +608,19 @@ def run_cross_asset_ranking_experiment(
         fold_rows.append(equal_metrics)
 
         for model_name in config.model_names:
-            scores = _score_test_panel(
+            scores, importance_for_split = _score_test_panel(
                 model_name=model_name,
                 train_panel=train_features,
                 test_panel=test_features,
                 feature_columns=feature_columns,
-                target_column=DEFAULT_TARGET_COLUMN,
+                target_column=target_column,
             )
+            for row in importance_for_split:
+                feature_importance_rows.append({
+                    "split_id": int(split_id),
+                    "model": model_name,
+                    **row,
+                })
             scored = test_features[[DEFAULT_DATE_COLUMN, DEFAULT_ASSET_COLUMN]].copy()
             scored["score"] = scores.values
             scored["model"] = model_name
@@ -707,7 +769,37 @@ def run_cross_asset_ranking_experiment(
         ),
         "rebalance_every": int(config.rebalance_every),
         "feature_normalization": str(config.feature_normalization),
+        "include_cross_sectional_features": bool(config.include_cross_sectional_features),
+        "include_regime_interactions": bool(config.include_regime_interactions),
     }
+
+    feature_importance_frame = (
+        pd.DataFrame(feature_importance_rows)
+        if feature_importance_rows
+        else pd.DataFrame(columns=["split_id", "model", "feature", "gain", "split_count"])
+    )
+
+    # ICIR + per-fold Spearman. Computed once per (model, split) using realized
+    # target values from the panel and the model's predicted scores from the
+    # per-split scored panel. Spearman is the same regardless of top_k (since
+    # top_k only changes the allocation policy, not the underlying scores), so
+    # results are broadcast across the top_k rows of the summary.
+    spearman_records, icir_records = _compute_spearman_and_icir(
+        scored_rows=scored_rows,
+        panel=panel,
+        target_column=target_column,
+        model_names=config.model_names,
+        date_col=DEFAULT_DATE_COLUMN,
+        asset_col=DEFAULT_ASSET_COLUMN,
+    )
+    if not spearman_records.empty:
+        fold_details_export = fold_details_export.merge(
+            spearman_records.rename(columns={"mean_spearman": "per_fold_mean_spearman"}),
+            on=["split_id", "model"],
+            how="left",
+        )
+    if not icir_records.empty:
+        summary = summary.merge(icir_records, on="model", how="left")
 
     return {
         "summary": summary,
@@ -717,5 +809,92 @@ def run_cross_asset_ranking_experiment(
         "portfolio_returns": pd.concat(portfolio_rows, axis=0, ignore_index=True) if portfolio_rows else pd.DataFrame(),
         "random_nulls": random_nulls,
         "null_pvalues": null_pvalues,
+        "feature_importance": feature_importance_frame,
+        "ranking_diagnostics": icir_records,
         "metadata": metadata,
     }
+
+
+def _compute_spearman_and_icir(
+    *,
+    scored_rows: list[pd.DataFrame],
+    panel: pd.DataFrame,
+    target_column: str,
+    model_names: tuple[str, ...],
+    date_col: str,
+    asset_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Per-(model, split) mean Spearman of scores vs realized target, plus per-model ICIR.
+
+    Returns (spearman_per_fold, icir_per_model) where
+    spearman_per_fold has columns [split_id, model, mean_spearman, n_dates] and
+    icir_per_model has columns [model, overall_mean_spearman, spearman_std_across_folds, icir, n_folds].
+    """
+
+    if not scored_rows or target_column not in panel.columns:
+        return pd.DataFrame(columns=["split_id", "model", "mean_spearman", "n_dates"]), pd.DataFrame(
+            columns=["model", "overall_mean_spearman", "spearman_std_across_folds", "icir", "n_folds"]
+        )
+
+    scored_all = pd.concat(scored_rows, axis=0, ignore_index=True)
+    panel_target = panel.set_index([date_col, asset_col])[target_column]
+
+    fold_rows: list[dict] = []
+    icir_rows: list[dict] = []
+    for model_name in model_names:
+        model_scored = scored_all[scored_all["model"] == model_name]
+        if model_scored.empty:
+            continue
+        per_fold_means: list[float] = []
+        for split_id, split_group in model_scored.groupby("split_id"):
+            rhos: list[float] = []
+            for date, date_group in split_group.groupby(date_col):
+                keys = [(date, a) for a in date_group[asset_col]]
+                try:
+                    targets = panel_target.reindex(keys)
+                except KeyError:
+                    continue
+                merged = pd.DataFrame(
+                    {
+                        "score": date_group["score"].to_numpy(),
+                        "target": targets.to_numpy(),
+                    }
+                ).dropna()
+                if len(merged) < 3:
+                    continue
+                rho = merged["score"].rank().corr(merged["target"].rank(), method="pearson")
+                if pd.notna(rho):
+                    rhos.append(float(rho))
+            if rhos:
+                mean_rho = float(np.mean(rhos))
+                fold_rows.append(
+                    {
+                        "split_id": int(split_id),
+                        "model": model_name,
+                        "mean_spearman": mean_rho,
+                        "n_dates": len(rhos),
+                    }
+                )
+                per_fold_means.append(mean_rho)
+        if per_fold_means:
+            overall_mean = float(np.mean(per_fold_means))
+            if len(per_fold_means) > 1:
+                fold_std = float(np.std(per_fold_means, ddof=1))
+            else:
+                fold_std = float("nan")
+            icir = (
+                overall_mean / fold_std
+                if fold_std and not np.isnan(fold_std) and fold_std > 0.0
+                else float("nan")
+            )
+            icir_rows.append(
+                {
+                    "model": model_name,
+                    "overall_mean_spearman": overall_mean,
+                    "spearman_std_across_folds": fold_std,
+                    "icir": icir,
+                    "n_folds": len(per_fold_means),
+                }
+            )
+
+    return pd.DataFrame(fold_rows), pd.DataFrame(icir_rows)

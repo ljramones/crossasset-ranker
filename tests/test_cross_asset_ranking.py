@@ -7,7 +7,10 @@ import pandas as pd
 import pytest
 
 from evaluation.cross_asset_ranking import (
+    add_cross_sectional_features,
     add_cross_sectional_ranks,
+    add_regime_interaction_features,
+    add_vix_zscore_to_panel,
     apply_rebalance_schedule,
     build_cross_asset_panel,
     build_equal_weight_allocations,
@@ -222,6 +225,23 @@ def test_random_top_k_allocations_are_deterministic_under_seed() -> None:
         .nunique()
     )
     assert (selected_per_date == 2).all(), "Each date must select exactly k assets in a top-k random null."
+
+
+def test_build_cross_asset_panel_column_names_track_forward_horizon() -> None:
+    """Horizon=20 keeps the historical column names; horizon=5 produces _5d_ names."""
+    frame_a = _synthetic_asset_frame(n_rows=80, seed=1, start="2020-01-02")
+    frame_b = _synthetic_asset_frame(n_rows=80, seed=2, start="2020-01-02")
+
+    panel_20 = build_cross_asset_panel({"A": frame_a, "B": frame_b}, forward_horizon=20, vol_window=20)
+    assert "forward_20d_return" in panel_20.columns
+    assert "trailing_20d_realized_vol" in panel_20.columns
+    assert "forward_20d_risk_adjusted_return" in panel_20.columns
+
+    panel_5 = build_cross_asset_panel({"A": frame_a, "B": frame_b}, forward_horizon=5, vol_window=20)
+    assert "forward_5d_return" in panel_5.columns
+    assert "trailing_20d_realized_vol" in panel_5.columns  # vol_window unchanged
+    assert "forward_5d_risk_adjusted_return" in panel_5.columns
+    assert "forward_20d_risk_adjusted_return" not in panel_5.columns
 
 
 def test_build_cross_asset_panel_inner_joins_dates() -> None:
@@ -544,3 +564,156 @@ def test_build_lambdarank_groups_returns_per_date_sizes() -> None:
 
 def test_build_lambdarank_groups_empty_panel() -> None:
     assert build_lambdarank_groups(pd.DataFrame(columns=["date", "asset"])) == []
+
+
+def _xs_features_panel(n_rows: int = 80, *, n_assets: int = 4) -> pd.DataFrame:
+    dates = pd.date_range("2020-01-02", periods=n_rows, freq="B")
+    rng = np.random.default_rng(0)
+    frames = []
+    for i, asset in enumerate(list("ABCD")[:n_assets]):
+        rets = rng.normal(0.0005 * (i + 1), 0.01, size=n_rows)
+        price = 100.0 * np.exp(np.cumsum(rets))
+        frames.append(
+            pd.DataFrame(
+                {
+                    "date": dates,
+                    "asset": asset,
+                    "return_1d": rets,
+                    "Adj Close": price,
+                }
+            )
+        )
+    return pd.concat(frames, axis=0, ignore_index=True).sort_values(["date", "asset"]).reset_index(drop=True)
+
+
+def test_add_cross_sectional_features_produces_ranks_in_unit_interval() -> None:
+    panel = _xs_features_panel(n_rows=80)
+    out = add_cross_sectional_features(panel)
+
+    for col in ("xs_rank_ret_5d", "xs_rank_ret_20d", "xs_rank_ret_60d", "xs_rank_vol_20d", "xs_rank_drawdown_60d"):
+        assert col in out.columns, f"missing column {col}"
+        valid = out[col].dropna()
+        assert valid.between(0.0, 1.0).all(), f"{col} out of [0, 1]"
+
+
+def test_add_cross_sectional_features_v1_set_contains_xs_rank_ret_5d() -> None:
+    """v3 reverts v2's drop — the full v1 base set must be present."""
+    panel = _xs_features_panel(n_rows=80)
+    out = add_cross_sectional_features(panel)
+    assert "xs_rank_ret_5d" in out.columns
+    # And the v2 beta features must be absent.
+    assert "xs_rank_beta_ew_rest_60d" not in out.columns
+    assert "xs_rank_beta_ew_rest_252d" not in out.columns
+
+
+def test_add_cross_sectional_features_highest_value_gets_rank_one() -> None:
+    """Construct a panel where one asset has a sharply higher trailing 5d return on a chosen date."""
+    panel = _xs_features_panel(n_rows=80)
+    last_5_dates = sorted(panel["date"].unique())[-5:]
+    panel.loc[(panel["date"].isin(last_5_dates)) & (panel["asset"] == "A"), "return_1d"] = 0.05
+    out = add_cross_sectional_features(panel)
+
+    target_date = panel["date"].max()
+    row = out[(out["date"] == target_date)].set_index("asset")
+    assert row.loc["A", "xs_rank_ret_5d"] == 1.0
+
+
+def test_add_cross_sectional_features_nan_for_insufficient_history() -> None:
+    panel = _xs_features_panel(n_rows=80)
+    out = add_cross_sectional_features(panel)
+
+    # Earliest dates lack a 60d history; return_60d-based rank should be NaN.
+    earliest = out["date"].min()
+    early_rows = out[out["date"] == earliest]
+    assert early_rows["xs_rank_ret_60d"].isna().all()
+
+
+def test_vix_zscore_is_causal_and_broadcasts_across_assets() -> None:
+    """VIX z-score uses only past values and is the same across assets per date."""
+    n_rows = 300
+    dates = pd.date_range("2020-01-02", periods=n_rows, freq="B")
+    rng = np.random.default_rng(11)
+    # Build a tiny 2-asset panel that already has a VIXClose column.
+    frames = []
+    vix_series = 18.0 + 4.0 * np.sin(np.linspace(0, 8 * np.pi, n_rows)) + rng.normal(0, 0.5, size=n_rows)
+    for asset in "AB":
+        rets = rng.normal(0.0, 0.01, size=n_rows)
+        price = 100.0 * np.exp(np.cumsum(rets))
+        frames.append(pd.DataFrame({"date": dates, "asset": asset, "return_1d": rets, "Adj Close": price, "VIXClose": vix_series}))
+    panel = pd.concat(frames, axis=0, ignore_index=True).sort_values(["date", "asset"]).reset_index(drop=True)
+
+    out = add_vix_zscore_to_panel(panel, window=252)
+    # First 251 dates lack a full window — z-score must be NaN.
+    early = out[out["date"].isin(sorted(out["date"].unique())[:251])]
+    assert early["vix_zscore_252d"].isna().all()
+    # After warmup the value must be the same across assets per date (market-state).
+    late = out[out["date"] == out["date"].max()].set_index("asset")["vix_zscore_252d"]
+    assert pd.notna(late.loc["A"])
+    assert late.loc["A"] == pytest.approx(late.loc["B"])
+
+
+def test_regime_interaction_features_are_product_of_rank_and_zscore() -> None:
+    """Each xs_rank_X_x_vix_z must equal element-wise product of base rank and VIX z."""
+    panel = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-01", "2020-01-01", "2020-01-02", "2020-01-02"]),
+            "asset": ["A", "B", "A", "B"],
+            "xs_rank_ret_5d": [0.5, 1.0, 0.0, 0.75],
+            "xs_rank_ret_20d": [0.25, 0.75, 0.5, 0.5],
+            "xs_rank_ret_60d": [0.1, 0.9, 0.4, 0.6],
+            "xs_rank_vol_20d": [0.3, 0.7, 0.2, 0.8],
+            "xs_rank_drawdown_60d": [0.0, 1.0, 0.5, 0.5],
+            "vix_zscore_252d": [2.0, 2.0, -1.5, -1.5],
+        }
+    )
+
+    out = add_regime_interaction_features(panel)
+
+    for base in (
+        "xs_rank_ret_5d", "xs_rank_ret_20d", "xs_rank_ret_60d",
+        "xs_rank_vol_20d", "xs_rank_drawdown_60d",
+    ):
+        new_col = f"{base}_x_vix_z"
+        expected = panel[base] * panel["vix_zscore_252d"]
+        np.testing.assert_allclose(out[new_col].to_numpy(), expected.to_numpy())
+
+
+def test_add_cross_sectional_features_preserves_row_count_and_existing_columns() -> None:
+    panel = _xs_features_panel(n_rows=80)
+    n_in = len(panel)
+    out = add_cross_sectional_features(panel)
+    assert len(out) == n_in
+    for col in panel.columns:
+        assert col in out.columns
+
+
+def test_feature_selector_accepts_xs_rank_and_interaction_columns() -> None:
+    panel = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-01"]),
+            "asset": ["A"],
+            "Adj Close": [1.0],
+            "return_1d": [0.0],
+            "xs_rank_ret_5d": [0.5],
+            "xs_rank_ret_20d": [0.5],
+            "xs_rank_vol_20d": [0.5],
+            "xs_rank_drawdown_60d": [0.0],
+            "xs_rank_vol_20d_x_vix_z": [0.5],
+            "vix_zscore_252d": [1.2],
+            "forward_5d_risk_adjusted_return": [0.0],
+            "cross_sectional_rank": [1.0],
+            "is_top_1": [1],
+        }
+    )
+
+    features = select_cross_asset_feature_columns(panel, target_col="forward_5d_risk_adjusted_return")
+    assert "xs_rank_ret_5d" in features
+    assert "xs_rank_ret_20d" in features
+    assert "xs_rank_vol_20d" in features
+    assert "xs_rank_drawdown_60d" in features
+    assert "xs_rank_vol_20d_x_vix_z" in features
+    assert "vix_zscore_252d" in features
+    # Legacy outputs still excluded.
+    assert "cross_sectional_rank" not in features
+    assert "is_top_1" not in features
+    assert "forward_5d_risk_adjusted_return" not in features

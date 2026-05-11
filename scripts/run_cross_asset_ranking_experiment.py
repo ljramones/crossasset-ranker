@@ -74,6 +74,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--include-cross-sectional-features",
+        action="store_true",
+        help=(
+            "Append per-date cross-sectional rank features (xs_rank_ret_5d/20d/60d, "
+            "xs_rank_vol_20d, xs_rank_drawdown_60d) to the panel. These are NOT "
+            "z-scored — they encode each asset's per-date position in the universe "
+            "and are the inputs that the per-asset feature stack cannot express."
+        ),
+    )
+    parser.add_argument(
+        "--include-regime-interactions",
+        action="store_true",
+        help=(
+            "Append regime-conditioned interaction features (each xs_rank feature × "
+            "trailing 252d VIX z-score). Requires --include-cross-sectional-features. "
+            "Interactions are continuous (signed, unbounded) — no re-ranking applied."
+        ),
+    )
+    parser.add_argument(
         "--prepare-missing",
         action="store_true",
         help="Allow prepare_single_asset_feature_frame to fetch missing raw caches via yfinance.",
@@ -112,6 +131,8 @@ def _config_from_args(args: argparse.Namespace) -> CrossAssetRankingConfig:
         decision_grade=bool(args.decision_grade or args.run_purpose == "decision_grade"),
         rebalance_every=int(args.rebalance_every),
         feature_normalization=str(args.feature_normalization),
+        include_cross_sectional_features=bool(args.include_cross_sectional_features),
+        include_regime_interactions=bool(args.include_regime_interactions),
     )
 
 
@@ -136,6 +157,8 @@ def _print_dry_run(args: argparse.Namespace, timestamp: str) -> None:
     print(f"  rebalance_every:      {args.rebalance_every}")
     print(f"  models:               {args.models or 'default (all 3)'}")
     print(f"  feature_normalization:{args.feature_normalization}")
+    print(f"  include_xs_features:  {args.include_cross_sectional_features}")
+    print(f"  include_regime_interactions: {args.include_regime_interactions}")
 
 
 def _markdown_table(frame: pd.DataFrame, *, max_rows: int = 50) -> str:
@@ -179,10 +202,12 @@ def write_output_bundle(
         "portfolio_returns": output_dir / f"cross_asset_ranking_portfolio_returns_{timestamp}.csv",
         "random_nulls": output_dir / f"cross_asset_ranking_random_nulls_{timestamp}.csv",
         "null_pvalues": output_dir / f"cross_asset_ranking_null_pvalues_{timestamp}.csv",
+        "feature_importance": output_dir / f"cross_asset_ranking_feature_importance_{timestamp}.csv",
+        "ranking_diagnostics": output_dir / f"cross_asset_ranking_ranking_diagnostics_{timestamp}.csv",
         "report": output_dir / f"cross_asset_ranking_report_{timestamp}.md",
         "metadata": output_dir / f"cross_asset_ranking_metadata_{timestamp}.json",
     }
-    for key in ("summary", "fold_details", "scored_panel", "allocations", "portfolio_returns", "random_nulls", "null_pvalues"):
+    for key in ("summary", "fold_details", "scored_panel", "allocations", "portfolio_returns", "random_nulls", "null_pvalues", "feature_importance", "ranking_diagnostics"):
         frame = result.get(key)
         if frame is not None and not frame.empty:
             frame.to_csv(paths[key], index=False)

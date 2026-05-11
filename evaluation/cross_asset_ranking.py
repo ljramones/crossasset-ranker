@@ -59,9 +59,14 @@ _FORBIDDEN_FEATURE_PREFIXES: tuple[str, ...] = (
 )
 
 _FORBIDDEN_FEATURE_SUBSTRINGS: tuple[str, ...] = (
-    "_rank",
     "_label",
 )
+# Note: ``_rank`` was previously listed here to exclude the legacy
+# ``cross_sectional_rank`` / ``cross_sectional_percentile_rank`` output columns
+# from being used as features. The ``cross_sectional_`` prefix in
+# ``_FORBIDDEN_FEATURE_PREFIXES`` already covers those, and the project's new
+# cross-sectional input features intentionally use the ``xs_rank_*`` naming.
+# Keeping ``_rank`` in the substring blacklist would silently filter them out.
 
 
 def compute_forward_return(
@@ -162,22 +167,25 @@ def build_cross_asset_panel(
         raise ValueError("No common dates across assets — check input frames or universe.")
 
     common_index = pd.DatetimeIndex(sorted(common_dates))
+    forward_return_col = f"forward_{int(forward_horizon)}d_return"
+    trailing_vol_col = f"trailing_{int(vol_window)}d_realized_vol"
+    risk_adjusted_col = f"forward_{int(forward_horizon)}d_risk_adjusted_return"
     rows: list[pd.DataFrame] = []
     for asset, prepared in normalized.items():
         prepared = prepared[prepared[date_col].isin(common_index)].copy()
         prepared = prepared.sort_values(date_col).reset_index(drop=True)
         prepared["asset"] = asset
         prepared = prepared.set_index(date_col, drop=False)
-        prepared["forward_20d_return"] = compute_forward_return(
+        prepared[forward_return_col] = compute_forward_return(
             prepared[return_col],
             horizon=forward_horizon,
         ).values
-        prepared["trailing_20d_realized_vol"] = compute_trailing_realized_vol(
+        prepared[trailing_vol_col] = compute_trailing_realized_vol(
             prepared[return_col],
             window=vol_window,
             annualization=annualization,
         ).values
-        prepared["forward_20d_risk_adjusted_return"] = compute_forward_risk_adjusted_return(
+        prepared[risk_adjusted_col] = compute_forward_risk_adjusted_return(
             prepared[return_col],
             forward_horizon=forward_horizon,
             vol_window=vol_window,
@@ -531,6 +539,184 @@ def normalize_features_per_asset_train_only(
         # Zero-std columns become NaN above; map to 0 (constant features carry no info).
         normalized = normalized.fillna(0.0)
         out.loc[asset_idx, feature_list] = normalized.values
+    return out
+
+
+_CROSS_SECTIONAL_FEATURE_COLUMNS: tuple[str, ...] = (
+    "xs_rank_ret_5d",
+    "xs_rank_ret_20d",
+    "xs_rank_ret_60d",
+    "xs_rank_vol_20d",
+    "xs_rank_drawdown_60d",
+)
+
+_REGIME_INTERACTION_FEATURE_COLUMNS: tuple[str, ...] = (
+    "xs_rank_ret_5d_x_vix_z",
+    "xs_rank_ret_20d_x_vix_z",
+    "xs_rank_ret_60d_x_vix_z",
+    "xs_rank_vol_20d_x_vix_z",
+    "xs_rank_drawdown_60d_x_vix_z",
+)
+
+
+def _per_date_normalized_rank(series_in_date: pd.Series) -> pd.Series:
+    """Rank a per-date Series into [0, 1] — highest value → 1.0, lowest → 0.0.
+
+    NaN inputs receive NaN ranks (``Series.rank`` default). Dates with fewer
+    than two valid observations are returned all-NaN.
+    """
+    ranks = series_in_date.rank(ascending=True, method="average")
+    valid = int(series_in_date.notna().sum())
+    if valid <= 1:
+        return pd.Series(np.nan, index=series_in_date.index, dtype="float64")
+    return (ranks - 1.0) / (valid - 1.0)
+
+
+def add_cross_sectional_features(
+    panel: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    asset_col: str = "asset",
+    return_col: str = "return_1d",
+    price_col: str = "Adj Close",
+) -> pd.DataFrame:
+    """Append per-date cross-sectional rank features to a long-format panel.
+
+    Five features are added (each normalized to [0, 1] per date — highest value
+    earning the largest fraction):
+
+    - ``xs_rank_ret_5d`` / ``xs_rank_ret_20d`` / ``xs_rank_ret_60d`` — rank of
+      trailing log-return over 5 / 20 / 60 trading days.
+    - ``xs_rank_vol_20d`` — rank of trailing 20-day realized return volatility.
+    - ``xs_rank_drawdown_60d`` — rank of current drawdown
+      (``1 - price / rolling_max(price, 60)``), so the most-drawn-down asset
+      on a given date earns rank 1.0.
+
+    The function does NOT z-score these features; they are already in [0, 1]
+    by construction and the per-date rank encoding is the entire point of the
+    feature. Existing per-asset features in the panel are left untouched.
+
+    The function is leakage-free: every input uses only contemporaneous and
+    backward-looking information, and the per-date rank uses only same-day
+    cross-section across the universe.
+    """
+
+    if return_col not in panel.columns:
+        raise KeyError(f"add_cross_sectional_features: missing {return_col!r}.")
+    if price_col not in panel.columns:
+        raise KeyError(f"add_cross_sectional_features: missing {price_col!r}.")
+
+    out = panel.copy()
+    out[date_col] = pd.to_datetime(out[date_col])
+    out = out.sort_values([asset_col, date_col]).reset_index(drop=True)
+
+    # Decide once which per-asset inputs need to be computed (must be evaluated
+    # *before* the asset loop, otherwise the first asset adds the column and the
+    # check returns False for every subsequent asset).
+    need_return_5d = "return_5d" not in out.columns
+    need_return_20d = "return_20d" not in out.columns
+    need_realized_vol_20 = "realized_vol_20" not in out.columns
+
+    for asset, group_idx in out.groupby(asset_col).groups.items():
+        asset_idx = pd.Index(group_idx)
+        returns = out.loc[asset_idx, return_col].astype(float)
+        if need_return_5d:
+            out.loc[asset_idx, "return_5d"] = np.expm1(np.log1p(returns).rolling(5).sum()).to_numpy()
+        if need_return_20d:
+            out.loc[asset_idx, "return_20d"] = np.expm1(np.log1p(returns).rolling(20).sum()).to_numpy()
+        # return_60d is not produced by build_feature_set; always compute here.
+        out.loc[asset_idx, "return_60d"] = np.expm1(np.log1p(returns).rolling(60).sum()).to_numpy()
+        if need_realized_vol_20:
+            out.loc[asset_idx, "realized_vol_20"] = returns.rolling(20).std(ddof=1).to_numpy()
+        # current drawdown from 60-day rolling peak — always compute here.
+        prices = out.loc[asset_idx, price_col].astype(float)
+        rolling_peak = prices.rolling(60, min_periods=2).max()
+        drawdown = 1.0 - prices / rolling_peak.replace(0.0, np.nan)
+        out.loc[asset_idx, "current_drawdown_60d"] = drawdown.to_numpy()
+
+    out = out.sort_values([date_col, asset_col]).reset_index(drop=True)
+
+    rank_specs = (
+        ("xs_rank_ret_5d", "return_5d"),
+        ("xs_rank_ret_20d", "return_20d"),
+        ("xs_rank_ret_60d", "return_60d"),
+        ("xs_rank_vol_20d", "realized_vol_20"),
+        ("xs_rank_drawdown_60d", "current_drawdown_60d"),
+    )
+    for new_col, source_col in rank_specs:
+        out[new_col] = out.groupby(date_col, group_keys=False)[source_col].transform(_per_date_normalized_rank)
+    return out
+
+
+def add_vix_zscore_to_panel(
+    panel: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    vix_col: str = "VIXClose",
+    window: int = 252,
+    output_col: str = "vix_zscore_252d",
+) -> pd.DataFrame:
+    """Append a causal trailing ``window``-day VIX z-score to ``panel``.
+
+    VIX is a market-state series — the same value applies to every asset on a
+    given date. The function therefore computes the z-score on the unique
+    per-date VIX series and broadcasts back to all (date, asset) rows of the
+    long-format panel.
+
+    Causality: ``pandas.Series.rolling(window, min_periods=window)`` uses the
+    values at times t-window+1 through t inclusive. VIXClose(t) is known by
+    close of t and the one-bar-lag convention applied downstream means weights
+    derived at end-of-t affect returns from t+1, so including t in the window
+    is leakage-safe.
+    """
+
+    if vix_col not in panel.columns:
+        raise KeyError(f"add_vix_zscore_to_panel: missing {vix_col!r} column.")
+
+    out = panel.copy()
+    out[date_col] = pd.to_datetime(out[date_col])
+    per_date = (
+        out.sort_values(date_col)[[date_col, vix_col]]
+        .drop_duplicates(date_col)
+        .set_index(date_col)[vix_col]
+        .astype(float)
+    )
+    rolling_mean = per_date.rolling(window, min_periods=window).mean()
+    rolling_std = per_date.rolling(window, min_periods=window).std(ddof=1)
+    z = (per_date - rolling_mean) / rolling_std.replace(0.0, np.nan)
+    z = z.rename(output_col).reset_index()
+    out = out.merge(z, on=date_col, how="left")
+    return out
+
+
+def add_regime_interaction_features(
+    panel: pd.DataFrame,
+    *,
+    base_features: Iterable[str] = _CROSS_SECTIONAL_FEATURE_COLUMNS,
+    regime_col: str = "vix_zscore_252d",
+    suffix: str = "_x_vix_z",
+) -> pd.DataFrame:
+    """Append element-wise regime-conditioned interaction features.
+
+    For each ``feature`` in ``base_features`` the output adds a column
+    ``f"{feature}{suffix}"`` equal to ``panel[feature] * panel[regime_col]``.
+    The result is signed and unbounded; the cross-sectional rank flooring at 0
+    means low-rank assets contribute near-zero regardless of regime, while
+    top-ranked assets are amplified/inverted by the sign and magnitude of the
+    regime indicator. This is intentional — discretizing or re-ranking would
+    discard the very information the interaction is encoding.
+    """
+
+    if regime_col not in panel.columns:
+        raise KeyError(f"add_regime_interaction_features: missing {regime_col!r} column.")
+    out = panel.copy()
+    regime = out[regime_col].astype(float)
+    for feature in base_features:
+        if feature not in out.columns:
+            raise KeyError(
+                f"add_regime_interaction_features: missing base feature {feature!r}."
+            )
+        out[f"{feature}{suffix}"] = out[feature].astype(float) * regime
     return out
 
 
