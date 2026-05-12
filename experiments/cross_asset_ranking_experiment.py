@@ -17,7 +17,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
@@ -53,6 +53,7 @@ KNOWN_MODELS: tuple[str, ...] = (
     "linear_regression",
     "hist_gradient_boosting",
     "lambdarank",
+    "ridge",
 )
 from evaluation.metrics import compute_return_stream_metrics
 from evaluation.walk_forward import generate_walk_forward_splits
@@ -276,6 +277,18 @@ def _build_model(name: str) -> Pipeline | None:
                 ),
             ]
         )
+    if name == "ridge":
+        # Ridge with cross-validated alpha selection. RidgeCV's default
+        # leave-one-out CV across a small alpha grid is sufficient — Ridge is
+        # well-known to be relatively insensitive to alpha across reasonable
+        # ranges and this is a diagnostic comparison, not a tuning sweep.
+        return Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("model", RidgeCV(alphas=(0.01, 0.1, 1.0, 10.0, 100.0))),
+            ]
+        )
     raise ValueError(f"Unknown model name: {name!r}")
 
 
@@ -333,7 +346,27 @@ def _score_test_panel(
         return pd.Series(np.nan, index=test_panel.index, name="score"), [], None
     pipeline.fit(train[feature_columns], train[target_column])
     scores = pd.Series(pipeline.predict(test_panel[feature_columns]), index=test_panel.index, name="score")
-    return scores, [], None
+
+    # For linear models, expose coefficient magnitudes via the same
+    # feature_importance schema used by LambdaRank (|coef| in the "gain"
+    # column, signed coef and selected alpha as auxiliary fields).
+    importance_rows: list[dict] = []
+    fitted_model = pipeline.named_steps.get("model") if hasattr(pipeline, "named_steps") else None
+    if fitted_model is not None and hasattr(fitted_model, "coef_"):
+        coefs = np.asarray(fitted_model.coef_, dtype=float)
+        selected_alpha = getattr(fitted_model, "alpha_", None)
+        for i, feature in enumerate(feature_columns):
+            row = {
+                "feature": str(feature),
+                "gain": float(abs(coefs[i])),
+                "split_count": 1,
+                "coef": float(coefs[i]),
+            }
+            if selected_alpha is not None:
+                row["selected_alpha"] = float(selected_alpha)
+            importance_rows.append(row)
+
+    return scores, importance_rows, None
 
 
 def _fit_lambdarank_on_panel(
